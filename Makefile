@@ -7,8 +7,8 @@ ifneq "$(GIT_DESC)" ""
 endif
 
 CC	?= gcc
-CFLAGS += -Wall -std=c99 -Os -DVERSION="\"$(VERSION)\"" -D_GNU_SOURCE
-LDFLAGS += -lxcb -lxcb-xinerama -lxcb-randr
+CFLAGS += -Wall -std=c99 -Os -DVERSION="\"$(VERSION)\"" -D_GNU_SOURCE -I/usr/include/freetype2
+LDFLAGS += -lxcb -lxcb-xinerama -lxcb-randr -lX11 -lXft -lX11-xcb
 CFDEBUG = -g3 -pedantic -Wall -Wunused-parameter -Wlong-long \
           -Wsign-conversion -Wconversion -Wimplicit-function-declaration
 
