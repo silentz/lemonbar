@@ -16,6 +16,9 @@
 #include <xcb/xinerama.h>
 #endif
 #include <xcb/randr.h>
+#include <X11/Xft/Xft.h>
+#include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
 #include "utils.h"
 
 // Here be dragons
@@ -29,6 +32,7 @@ typedef struct font_t {
     uint16_t char_max;
     uint16_t char_min;
     xcb_charinfo_t *width_lut;
+    XftFont* xft_font;
 } font_t;
 
 typedef struct monitor_t {
@@ -106,12 +110,28 @@ static const rgba_t WHITE = (rgba_t){ .r = 255, .g = 255, .b = 255, .a = 255 };
 static int num_outputs = 0;
 static char **output_names = NULL;
 
+#define MAX_WIDTHS (1 << 16)
+static wchar_t xft_char[MAX_WIDTHS];
+static char    xft_width[MAX_WIDTHS];
+static Display *dpy;
+static XftDraw *xft_draw;
+static Visual *visual_ptr;
+static XftColor sel_fg;
+static int screen_number = 0;
+
 void
 update_gc (void)
 {
     xcb_change_gc(c, gc[GC_DRAW], XCB_GC_FOREGROUND, (const uint32_t []){ fgc.v });
     xcb_change_gc(c, gc[GC_CLEAR], XCB_GC_FOREGROUND, (const uint32_t []){ bgc.v });
     xcb_change_gc(c, gc[GC_ATTR], XCB_GC_FOREGROUND, (const uint32_t []){ ugc.v });
+    XftColorFree(dpy, visual_ptr, colormap , &sel_fg);
+    char color[] = "#ffffff";
+    uint32_t nfgc = fgc.v & 0x00ffffff;
+    snprintf(color, sizeof(color), "#%06X", nfgc);
+    if (!XftColorAllocName (dpy, visual_ptr, colormap, color, &sel_fg)) {
+        fprintf(stderr, "Couldn't allocate xft font color '%s'\n", color);
+    }
 }
 
 void
@@ -207,9 +227,52 @@ draw_shift (monitor_t *mon, int x, int align, int w)
     draw_lines(mon, x, w);
 }
 
+int xft_char_width_slot (uint16_t ch) {
+    int slot = ch % MAX_WIDTHS;
+    while (xft_char[slot] != 0 && xft_char[slot] != ch) {
+        slot = (slot + 1) % MAX_WIDTHS;
+    }
+    return slot;
+}
+
+int xft_char_width (uint16_t ch, font_t *cur_font) {
+    int slot = xft_char_width_slot(ch);
+    if (!xft_char[slot]) {
+        XGlyphInfo gi;
+        FT_UInt glyph = XftCharIndex (dpy, cur_font->xft_font, (FcChar32) ch);
+        XftFontLoadGlyphs (dpy, cur_font->xft_font, FcFalse, &glyph, 1);
+        XftGlyphExtents (dpy, cur_font->xft_font, &glyph, 1, &gi);
+        XftFontUnloadGlyphs (dpy, cur_font->xft_font, &glyph, 1);
+        xft_char[slot] = ch;
+        if (gi.xOff >= gi.width) {
+            xft_width[slot] = gi.xOff;
+        } else {
+            xft_width[slot] = gi.width;
+        }
+        return xft_width[slot];
+    } else if (xft_char[slot] == ch) {
+        return xft_width[slot];
+    } else {
+        return 0;
+    }
+}
+
+int draw_char_xft(monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch) {
+    int ch_width = xft_char_width(ch, cur_font);
+    x = shift(mon, x, align, ch_width);
+    int y = bh / 2 + cur_font->height / 2- cur_font->descent;
+    XftDrawString16(xft_draw, &sel_fg, cur_font->xft_font, x, y, &ch, 1);
+    draw_lines(mon, x, ch_width);
+    return ch_width;
+}
+
 int
 draw_char (monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch)
 {
+    if (cur_font->xft_font) {
+        return draw_char_xft(mon, cur_font, x, align, ch);
+    }
+
     int ch_width = (cur_font->width_lut) ?
         cur_font->width_lut[ch - cur_font->char_min].character_width:
         cur_font->width;
@@ -439,6 +502,14 @@ area_add (char *str, const char *optend, char **end, monitor_t *mon, const int x
 bool
 font_has_glyph (font_t *font, const uint16_t c)
 {
+    if (font->xft_font) {
+        if (XftCharExists(dpy, font->xft_font, (FcChar32) c)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
     if (c < font->char_min || c > font->char_max)
         return false;
 
@@ -499,6 +570,12 @@ parse (char *text)
 
     // Reset the stack position
     area_stack.index = 0;
+
+    // Open XDraw
+    xft_draw = XftDrawCreate(dpy, cur_mon->pixmap, visual_ptr, colormap);
+    if (!xft_draw) {
+        fprintf(stderr, "Couldn't create xft drawable\n");
+    }
 
     for (monitor_t *m = monhead; m != NULL; m = m->next)
         fill_rect(m->pixmap, gc[GC_CLEAR], 0, 0, m->width, bh);
@@ -624,6 +701,12 @@ parse (char *text)
                             pos_x = 0;
                             align = ALIGN_L;
                         }
+
+                        XftDrawDestroy(xft_draw);
+                        xft_draw = XftDrawCreate(dpy, cur_mon->pixmap, visual_ptr, colormap);
+                        if (!xft_draw) {
+                            fprintf(stderr, "Couldn't create xft drawable\n");
+                        }
                     } break;
 
                     // Draw a N-pixel wide empty character.
@@ -722,6 +805,29 @@ parse (char *text)
             area_shift(cur_mon->window, align, w);
         }
     }
+    XftDrawDestroy(xft_draw);
+}
+
+int font_load_xft(const char *pattern) {
+    XftFont *xft_font = XftFontOpenName(dpy, screen_number, pattern);
+    if (!xft_font) {
+        return 0;
+    }
+
+    font_t *ret = xcalloc(1, sizeof(font_t));
+    ret->ptr = 0;
+    ret->xft_font = xft_font;
+    ret->descent = xft_font->descent;
+    ret->height = xft_font->ascent + xft_font->descent;
+
+    font_list = xreallocarray(font_list, font_count + 1, sizeof(font_t));
+    if (!font_list) {
+        fprintf(stderr, "Failed to allocate %d font descriptors", font_count + 1);
+        exit(EXIT_FAILURE);
+    }
+    font_list[font_count++] = ret;
+
+    return 1;
 }
 
 void
@@ -736,6 +842,9 @@ font_load (const char *pattern)
 
     cookie = xcb_open_font_checked(c, font, strlen(pattern), pattern);
     if (xcb_request_check (c, cookie)) {
+        if (font_load_xft(pattern)) {
+            return;
+        }
         fprintf(stderr, "Could not load font \"%s\"\n", pattern);
         return;
     }
@@ -1121,9 +1230,30 @@ get_xinerama_monitors (void)
 }
 #endif
 
+xcb_visualid_t get_visual_xft() {
+    XVisualInfo xv;
+    xv.depth = 32;
+    int result = 0;
+    XVisualInfo* result_ptr = NULL;
+    result_ptr = XGetVisualInfo(dpy, VisualDepthMask, &xv, &result);
+
+    if (result > 0) {
+        visual_ptr = result_ptr->visual;
+        return result_ptr->visualid;
+    }
+
+    // Fallback to the default one
+    visual_ptr = DefaultVisual(dpy, screen_number);
+    return scr->root_visual;
+}
+
 xcb_visualid_t
 get_visual (void)
 {
+    if (dpy) {
+        return get_visual_xft();
+    }
+
     xcb_depth_iterator_t iter;
 
     iter = xcb_screen_allowed_depths_iterator(scr);
@@ -1205,8 +1335,22 @@ parse_output_string(char *str)
 void
 xconn (void)
 {
-    // Connect to X
-    c = xcb_connect (NULL, NULL);
+    // Open XDisplay
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "Couldn't execute XOpenDisplay\n");
+        xcb_disconnect(c);
+        exit(EXIT_FAILURE);
+    }
+
+    c = XGetXCBConnection(dpy);
+    if (!c) {
+        fprintf (stderr, "Couldnt connect to X\n");
+        exit (EXIT_FAILURE);
+    }
+
+    XSetEventQueueOwner(dpy, XCBOwnsEventQueue);
+
     if (xcb_connection_has_error(c)) {
         fprintf(stderr, "Couldn't connect to X\n");
         exit(EXIT_FAILURE);
@@ -1325,6 +1469,14 @@ init (char *wm_name)
             xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8 ,strlen(wm_name), wm_name);
     }
 
+    char color[] = "#ffffff";
+    uint32_t nfgc = fgc.v & 0x00ffffff;
+    snprintf(color, sizeof(color), "#%06X", nfgc);
+
+    if (!XftColorAllocName (dpy, visual_ptr, colormap, color, &sel_fg)) {
+        fprintf(stderr, "Couldn't allocate xft font color '%s'\n", color);
+    }
+
     xcb_flush(c);
 }
 
@@ -1339,6 +1491,10 @@ cleanup (void)
     free(area_stack.ptr);
 
     for (int i = 0; i < font_count; i++) {
+        if (font_list[i]->xft_font) {
+            XftFontClose(dpy, font_list[i]->xft_font);
+            continue;
+        }
         xcb_close_font(c, font_list[i]->ptr);
         free(font_list[i]->width_lut);
         free(font_list[i]);
@@ -1354,6 +1510,7 @@ cleanup (void)
         monhead = next;
     }
 
+    XftColorFree(dpy, visual_ptr, colormap, &sel_fg);
     xcb_free_colormap(c, colormap);
 
     if (gc[GC_DRAW])
@@ -1364,6 +1521,8 @@ cleanup (void)
         xcb_free_gc(c, gc[GC_ATTR]);
     if (c)
         xcb_disconnect(c);
+    if (dpy)
+        XCloseDisplay(dpy);
 }
 
 void
